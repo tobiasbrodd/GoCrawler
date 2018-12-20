@@ -45,13 +45,15 @@ func DecreaseSitesLeft() {
 }
 
 // SitesHandler handles the sites channel
-func SitesHandler() {
+func SitesHandler(verbose bool) {
 	visited := map[string]bool{}
 
 	for s := range sites {
 		url := s.url
 		if _, ok := visited[url]; ok {
-			fmt.Printf("Already visited %v\n", url)
+			if verbose {
+				fmt.Printf("Already visited %v\n", url)
+			}
 		} else {
 			visited[url] = true
 			IncreaseSitesLeft()
@@ -63,13 +65,17 @@ func SitesHandler() {
 }
 
 // Crawler crawls a site
-func Crawler(s site, depth int, fetcher Fetcher) {
-	fmt.Printf("Crawling URL: %v\n", s.url)
+func Crawler(s site, depth int, fetcher Fetcher, verbose bool) {
+	if verbose {
+		fmt.Printf("Crawling URL: %v\n", s.url)
+	}
 
 	resp, err := fetcher.Fetch(s.url)
 
 	if err != nil {
-		fmt.Printf("Error on %v: %v\n", s.url, err)
+		if verbose {
+			fmt.Printf("Error on %v: %v\n", s.url, err)
+		}
 		DecreaseSitesLeft()
 		return
 	}
@@ -77,7 +83,9 @@ func Crawler(s site, depth int, fetcher Fetcher) {
 	responses <- resp
 
 	if s.depth >= depth {
-		fmt.Printf("Reached max depth: %v\n", depth)
+		if verbose {
+			fmt.Printf("Reached max depth: %v\n", depth)
+		}
 		DecreaseSitesLeft()
 		return
 	}
@@ -90,34 +98,36 @@ func Crawler(s site, depth int, fetcher Fetcher) {
 }
 
 // Crawl the web
-func Crawl(baseURL string, depth int) {
+func Crawl(baseURL string, depth int, verbose bool) {
 	fetcher := fetcher{}
 
-	go SitesHandler()
+	go SitesHandler(verbose)
 
 	sites <- site{baseURL, 1}
 	for s := range visit {
-		go Crawler(s, depth, fetcher)
+		go Crawler(s, depth, fetcher, verbose)
 	}
 
 	close(responses)
 }
 
 // Analyser converts a response to a result
-func Analyser(resp response, parser Parser) {
-	fmt.Printf("Analysing response from: %v\n", resp.url)
+func Analyser(resp response, parser Parser, verbose bool) {
+	if verbose {
+		fmt.Printf("Analysing response from: %v\n", resp.url)
+	}
 
 	results <- parser.Parse(resp)
 	waitGroup.Done()
 }
 
 // Analyse responses
-func Analyse() {
+func Analyse(verbose bool) {
 	parser := parser{}
 
 	for resp := range responses {
 		waitGroup.Add(1)
-		go Analyser(resp, parser)
+		go Analyser(resp, parser, verbose)
 	}
 
 	waitGroup.Wait()
@@ -127,10 +137,12 @@ func Analyse() {
 func main() {
 	url := flag.String("url", "https://golang.org/", "Set starting URL.")
 	depth := flag.Int("depth", 1, "Set to >= 1 to specify depth.")
+	verbose := flag.Bool("verbose", true, "Set to false to disable printing.")
+
 	flag.Parse()
 
-	go Crawl(*url, *depth)
-	go Analyse()
+	go Crawl(*url, *depth, *verbose)
+	go Analyse(*verbose)
 
 	for res := range results {
 		fmt.Printf("Result: %v\n", res.url)
