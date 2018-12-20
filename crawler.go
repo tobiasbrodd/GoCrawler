@@ -1,37 +1,29 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/net/html"
 )
 
-type response struct {
-	url  string
-	body string
-	urls []string
-}
+// ---------- Crawler ----------
 
-type result struct {
-	url  string
-	body string
-}
-
-// Fetcher fetches responses
-type Fetcher interface {
-	Fetch(url string) (resp response, err error)
-}
-
-// Parser parses responses
-type Parser interface {
-	Parse(resp response) (res result)
+type site struct {
+	url   string
+	depth int
 }
 
 var responses = make(chan response)
 var results = make(chan result)
 
-var visit = make(chan string)
-var sites = make(chan string)
+var visit = make(chan site)
+var sites = make(chan site)
 
 var done = make(chan bool)
 
@@ -56,13 +48,14 @@ func DecreaseSitesLeft() {
 func SitesHandler() {
 	visited := map[string]bool{}
 
-	for url := range sites {
+	for s := range sites {
+		url := s.url
 		if _, ok := visited[url]; ok {
 			fmt.Printf("Already visited %v\n", url)
 		} else {
 			visited[url] = true
 			IncreaseSitesLeft()
-			visit <- url
+			visit <- s
 		}
 	}
 
@@ -70,35 +63,41 @@ func SitesHandler() {
 }
 
 // Crawler crawls a site
-func Crawler(url string, fetcher Fetcher) {
-	fmt.Printf("Crawling %v\n", url)
+func Crawler(s site, depth int, fetcher Fetcher) {
+	fmt.Printf("Crawling URL: %v\n", s.url)
 
-	resp, err := fetcher.Fetch(url)
+	resp, err := fetcher.Fetch(s.url)
 
 	if err != nil {
-		fmt.Printf("Error on %v: %v\n", url, err)
+		fmt.Printf("Error on %v: %v\n", s.url, err)
 		DecreaseSitesLeft()
 		return
 	}
 
 	responses <- resp
 
+	if s.depth >= depth {
+		fmt.Printf("Reached max depth: %v\n", depth)
+		DecreaseSitesLeft()
+		return
+	}
+
 	for _, url := range resp.urls {
-		sites <- url
+		sites <- site{url, s.depth + 1}
 	}
 
 	DecreaseSitesLeft()
 }
 
 // Crawl the web
-func Crawl(baseURL string) {
-	fmt.Printf("Begin crawl using base URL: %v\n", baseURL)
+func Crawl(baseURL string, depth int) {
+	fetcher := fetcher{}
 
 	go SitesHandler()
 
-	sites <- baseURL
-	for url := range visit {
-		go Crawler(url, fetcher)
+	sites <- site{baseURL, 1}
+	for s := range visit {
+		go Crawler(s, depth, fetcher)
 	}
 
 	close(responses)
@@ -106,7 +105,7 @@ func Crawl(baseURL string) {
 
 // Analyser converts a response to a result
 func Analyser(resp response, parser Parser) {
-	fmt.Printf("Analyse response: %v\n", resp.url)
+	fmt.Printf("Analysing response from: %v\n", resp.url)
 
 	results <- parser.Parse(resp)
 	waitGroup.Done()
@@ -114,9 +113,7 @@ func Analyser(resp response, parser Parser) {
 
 // Analyse responses
 func Analyse() {
-	fmt.Println("Begin analyse")
-
-	parser := fakeParser{}
+	parser := parser{}
 
 	for resp := range responses {
 		waitGroup.Add(1)
@@ -128,7 +125,11 @@ func Analyse() {
 }
 
 func main() {
-	go Crawl("https://golang.org/")
+	url := flag.String("url", "https://golang.org/", "Set starting URL.")
+	depth := flag.Int("depth", 1, "Set to >= 1 to specify depth.")
+	flag.Parse()
+
+	go Crawl(*url, *depth)
 	go Analyse()
 
 	for res := range results {
@@ -136,32 +137,97 @@ func main() {
 	}
 }
 
-type fakeResponse struct {
-	body string
+// ---------- Fetcher ----------
+
+type response struct {
+	url  string
 	urls []string
 }
 
-type fakeFetcher map[string]*fakeResponse
+// Fetcher fetches responses
+type Fetcher interface {
+	Fetch(url string) (resp response, err error)
+}
 
-func (f *fakeFetcher) Fetch(url string) (resp response, err error) {
-	if resp, ok := (*f)[url]; ok {
-		return response{url, resp.body, resp.urls}, nil
+type fetcher struct{}
+
+// Fetch fetches URLs
+func (f fetcher) Fetch(url string) (response, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return response{url, []string{}}, err
 	}
-	return response{url, "", nil}, fmt.Errorf("Not found: %s", url)
+
+	return response{url, GetAllLinks(url, resp.Body)}, nil
 }
 
-type fakeParser struct{}
+// ---------- Parser ----------
 
-func (f fakeParser) Parse(resp response) (res result) {
-	return result{resp.url, resp.body}
+type result struct {
+	url string
 }
 
-var fetcher = &fakeFetcher{
-	"https://golang.org/": &fakeResponse{
-		"The Go Programming Language",
-		[]string{
-			"https://golang.org/pkg/",
-			"https://golang.org/cmd/",
-		},
-	},
+// Parser parses responses
+type Parser interface {
+	Parse(resp response) (res result)
+}
+
+type parser struct{}
+
+// Parse parses responses
+func (p parser) Parse(resp response) result {
+	return result{resp.url}
+}
+
+// ---------- Links ----------
+
+// GetAllLinks retrieves all links from a HTML body
+func GetAllLinks(baseURL string, body io.Reader) []string {
+	var links []string
+	page := html.NewTokenizer(body)
+	for {
+		tokenType := page.Next()
+
+		switch tokenType {
+		case html.ErrorToken:
+			return links
+		case html.StartTagToken, html.EndTagToken:
+			token := page.Token()
+			if "a" == token.Data {
+				for _, attr := range token.Attr {
+					if attr.Key == "href" {
+						link := TrimLink(attr.Val)
+						if len(link) != 0 {
+							link = FixLink(baseURL, link)
+							links = append(links, link)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TrimLink removes characters in links
+func TrimLink(link string) string {
+	link = strings.TrimSpace(link)
+	link = strings.SplitN(link, "#", 2)[0]
+	link = strings.Trim(link, "#")
+	link = strings.TrimSpace(link)
+
+	return link
+}
+
+// FixLink fixes broken links
+func FixLink(baseURL string, link string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if len(link) > 1 && link[0:2] == "//" {
+		link = strings.TrimLeft(link, "/")
+		link = strings.Join([]string{"http://", link}, "")
+	} else if link[0] == '/' {
+		link = strings.TrimLeft(link, "/")
+		link = strings.Join([]string{baseURL, link}, "/")
+	}
+
+	return link
 }
